@@ -225,6 +225,11 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		end := min(start+mc.partSize, mc.size)
 		size := end - start
 
+		if sk, ok := chunkWriter.(interface{ SkipChunk(int) bool }); ok && sk.SkipChunk(chunk) {
+			fs.Debugf(mc.src, "multi-thread copy: skipping chunk %d/%d, already uploaded", chunk+1, mc.numChunks)
+			continue
+		}
+
 		// Reserve the memory first so we don't open the source and wait for memory buffers for ages
 		// This also avoids creating an excess of goroutines all waiting on memory.
 		var rw *pool.RW

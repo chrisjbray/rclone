@@ -402,3 +402,73 @@ func TestMultithreadCopyWriterAtErrors(t *testing.T) {
 		}
 	}
 }
+
+// skipChunkWriter is a test ChunkWriter honouring SkipChunk.
+type skipChunkWriter struct {
+	mu      sync.Mutex
+	written []int
+	skip    map[int]bool
+	onClose func()
+}
+
+func (w *skipChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.written = append(w.written, chunkNumber)
+	n, err := io.Copy(io.Discard, reader)
+	return n, err
+}
+
+func (w *skipChunkWriter) Close(ctx context.Context) error {
+	if w.onClose != nil {
+		w.onClose()
+	}
+	return nil
+}
+func (w *skipChunkWriter) Abort(ctx context.Context) error { return nil }
+func (w *skipChunkWriter) SkipChunk(chunkNumber int) bool  { return w.skip[chunkNumber] }
+
+func TestMultithreadCopySkipsResumedChunks(t *testing.T) {
+	ctx := context.Background()
+	ci := fs.GetConfig(ctx)
+
+	oldStreams := ci.MultiThreadStreams
+	oldCutoff := ci.MultiThreadCutoff
+	oldChunk := ci.MultiThreadChunkSize
+	defer func() {
+		ci.MultiThreadStreams = oldStreams
+		ci.MultiThreadCutoff = oldCutoff
+		ci.MultiThreadChunkSize = oldChunk
+	}()
+	ci.MultiThreadStreams = 2
+	ci.MultiThreadCutoff = 10
+
+	f, err := mockfs.NewFs(ctx, "potato", "", nil)
+	require.NoError(t, err)
+	mfs, ok := f.(*mockfs.Fs)
+	require.True(t, ok, "mockfs.NewFs should return *mockfs.Fs")
+	content := []byte(random.String(100)) // chunks 0..3 at 30 bytes
+	src := mockobject.New("file.txt").WithContent(content, mockobject.SeekModeNone)
+	srcFs, err := mockfs.NewFs(ctx, "sausage", "", nil)
+	require.NoError(t, err)
+	src.SetFs(srcFs)
+
+	writer := &skipChunkWriter{skip: map[int]bool{0: true, 2: true}}
+	f.Features().OpenChunkWriter = func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+		return fs.ChunkWriterInfo{ChunkSize: 30, Concurrency: 2}, writer, nil
+	}
+	// multiThreadCopy looks the object up via f.NewObject after Close;
+	// have Close register the finished object with the mock fs.
+	writer.onClose = func() {
+		done := mockobject.New("file.txt").WithContent(content, mockobject.SeekModeNone)
+		mfs.AddObject(done)
+	}
+
+	accounting.GlobalStats().ResetCounters()
+	tr := accounting.GlobalStats().NewTransfer(src, nil)
+	defer tr.Done(ctx, nil)
+
+	_, err = multiThreadCopy(ctx, f, "file.txt", src, 2, tr)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []int{1, 3}, writer.written)
+}

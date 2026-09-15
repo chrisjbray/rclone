@@ -422,6 +422,24 @@ WARNING: Storing parts of an incomplete multipart upload counts towards space us
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name: "resume_multipart_uploads",
+			Help: `Resume interrupted multipart uploads instead of restarting from byte 0.
+
+When set, rclone lists unfinished multipart uploads for the destination
+key before starting a new one. If an unfinished upload has parts that
+match the local file layout (same chunk size, same part sizes), rclone
+adopts it and uploads only the missing parts.
+
+Falls back to a fresh multipart upload when no usable unfinished
+upload exists. Use with --s3-leave-parts-on-error so interrupted
+transfers leave their parts behind for the next run to resume.
+
+WARNING: Storing parts of an incomplete multipart upload counts towards
+space usage on S3 and will add additional costs if not cleaned up.
+`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name: "list_chunk",
 			Help: `Size of listing chunk (response list for each ListObject S3 request).
 
@@ -1111,6 +1129,7 @@ type Options struct {
 	UseAccelerateEndpoint       bool                 `config:"use_accelerate_endpoint"`
 	UseARNRegion                bool                 `config:"use_arn_region"`
 	LeavePartsOnError           bool                 `config:"leave_parts_on_error"`
+	ResumeMultipartUploads      bool                 `config:"resume_multipart_uploads"`
 	ListChunk                   int32                `config:"list_chunk"`
 	ListVersion                 int                  `config:"list_version"`
 	ListURLEncode               fs.Tristate          `config:"list_url_encode"`
@@ -3826,6 +3845,131 @@ func (f *Fs) listMultipartUploads(ctx context.Context, bucket, key string) (uplo
 	return uploads, nil
 }
 
+// SkipChunk reports whether chunkNumber (0-based) was already uploaded
+// as part of a resumed multipart upload and need not be uploaded again.
+// It is consulted by the generic multipart upload loops via type assertion
+// so other backends are unaffected.
+func (w *s3ChunkWriter) SkipChunk(chunkNumber int) bool {
+	return w.resumedParts[chunkNumber]
+}
+
+// listMultipartParts lists all uploaded parts for (bucket, key, uploadID)
+func (f *Fs) listMultipartParts(ctx context.Context, bucket, key, uploadID string) (parts []types.Part, err error) {
+	var partNumberMarker *string
+	parts = []types.Part{}
+	for {
+		req := s3.ListPartsInput{
+			Bucket:           &bucket,
+			Key:              &key,
+			UploadId:         &uploadID,
+			PartNumberMarker: partNumberMarker,
+		}
+		var resp *s3.ListPartsOutput
+		err = f.pacer.Call(func() (bool, error) {
+			resp, err = f.c.ListParts(ctx, &req)
+			return f.shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list parts bucket %q key %q upload %q: %w", bucket, key, uploadID, err)
+		}
+		parts = append(parts, resp.Parts...)
+		if !deref(resp.IsTruncated) {
+			break
+		}
+		partNumberMarker = resp.NextPartNumberMarker
+	}
+	return parts, nil
+}
+
+// expectedPartLayout returns the size part partNum (1-based) must have for a
+// file of size bytes uploaded in chunks of chunkSize, and the total part count.
+func expectedPartLayout(size, chunkSize int64) (partSize func(partNum int32) int64, numParts int32) {
+	numParts = int32((size + chunkSize - 1) / chunkSize)
+	return func(partNum int32) int64 {
+		if partNum == numParts {
+			return size - int64(numParts-1)*chunkSize
+		}
+		return chunkSize
+	}, numParts
+}
+
+// matchResumedParts checks listed parts against the local file layout.
+// It returns the adopted parts or nil if the unfinished upload can't be reused.
+func matchResumedParts(parts []types.Part, size, chunkSize int64) (adopted map[int]types.CompletedPart, ok bool) {
+	if len(parts) == 0 {
+		return nil, false
+	}
+	expectedSize, numParts := expectedPartLayout(size, chunkSize)
+	adopted = make(map[int]types.CompletedPart, len(parts))
+	for _, p := range parts {
+		if p.PartNumber == nil || p.ETag == nil || p.Size == nil {
+			return nil, false
+		}
+		if *p.PartNumber < 1 || *p.PartNumber > numParts {
+			return nil, false
+		}
+		if *p.Size != expectedSize(*p.PartNumber) {
+			return nil, false
+		}
+		chunk := int(*p.PartNumber - 1)
+		if _, dup := adopted[chunk]; dup {
+			return nil, false
+		}
+		adopted[chunk] = types.CompletedPart{PartNumber: p.PartNumber, ETag: p.ETag}
+	}
+	return adopted, true
+}
+
+// resumeMultipartUpload finds an unfinished multipart upload for the
+// destination key whose parts match the local file, for resuming.
+//
+// It returns the upload ID, adopted chunk set and seeded completed parts,
+// or resumed=false to signal the caller should start a fresh upload.
+func (f *Fs) resumeMultipartUpload(ctx context.Context, ui uploadInfo, size, chunkSize int64) (uploadID *string, resumedParts map[int]bool, seeded []types.CompletedPart, resumed bool) {
+	if !f.opt.ResumeMultipartUploads || size <= 0 || chunkSize <= 0 {
+		return nil, nil, nil, false
+	}
+	bucket, key := ui.req.Bucket, ui.req.Key
+	if bucket == nil || key == nil {
+		return nil, nil, nil, false
+	}
+	uploads, err := f.listMultipartUploads(ctx, *bucket, *key)
+	if err != nil {
+		fs.Debugf(f, "resume: list unfinished uploads failed, starting fresh: %v", err)
+		return nil, nil, nil, false
+	}
+	// newest first so a retry adopts the latest attempt
+	slices.SortFunc(uploads, func(a, b types.MultipartUpload) int {
+		if a.Initiated == nil || b.Initiated == nil {
+			return 0
+		}
+		return b.Initiated.Compare(*a.Initiated)
+	})
+	for _, u := range uploads {
+		if u.Key == nil || u.UploadId == nil || *u.Key != *key {
+			continue // listMultipartUploads treats key as a prefix
+		}
+		parts, err := f.listMultipartParts(ctx, *bucket, *key, *u.UploadId)
+		if err != nil {
+			fs.Debugf(f, "resume: list parts for upload %q failed: %v", *u.UploadId, err)
+			continue
+		}
+		adopted, ok := matchResumedParts(parts, size, chunkSize)
+		if !ok {
+			fs.Debugf(f, "resume: upload %q parts don't match local file, ignoring", *u.UploadId)
+			continue
+		}
+		resumedParts = make(map[int]bool, len(adopted))
+		completed := make([]types.CompletedPart, 0, len(adopted))
+		for chunk, part := range adopted {
+			resumedParts[chunk] = true
+			completed = append(completed, part)
+		}
+		return u.UploadId, resumedParts, completed, true
+	}
+	return nil, nil, nil, false
+}
+
 func (f *Fs) listMultipartUploadsAll(ctx context.Context) (uploadsMap map[string][]types.MultipartUpload, err error) {
 	uploadsMap = make(map[string][]types.MultipartUpload)
 	bucket, directory := f.split("")
@@ -4556,6 +4700,8 @@ type s3ChunkWriter struct {
 	multiPartUploadInput *s3.CreateMultipartUploadInput
 	completedPartsMu     sync.Mutex
 	completedParts       []types.CompletedPart
+	resumedParts         map[int]bool // chunk numbers (0-based) adopted from a resumed upload
+	resumed              bool         // true if this writer adopted an unfinished multipart upload
 	eTag                 string
 	versionID            string
 	md5sMu               sync.Mutex
@@ -4606,20 +4752,29 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		chunkSize = chunksize.Calculator(src, size, uploadParts, chunkSize)
 	}
 
+	uploadID, resumedParts, seeded, resumed := f.resumeMultipartUpload(ctx, ui, size, int64(chunkSize))
+	if resumed {
+		fs.Logf(o, "resumed multipart upload %q with %d existing part(s), uploading the rest", *uploadID, len(resumedParts))
+	}
+
 	var mOut *s3.CreateMultipartUploadOutput
-	err = f.pacer.Call(func() (bool, error) {
-		mOut, err = f.c.CreateMultipartUpload(ctx, &mReq)
-		if err == nil {
-			if mOut == nil {
-				err = fserrors.RetryErrorf("internal error: no info from multipart upload")
-			} else if mOut.UploadId == nil {
-				err = fserrors.RetryErrorf("internal error: no UploadId in multipart upload: %#v", *mOut)
+	if resumed {
+		mOut = &s3.CreateMultipartUploadOutput{UploadId: uploadID}
+	} else {
+		err = f.pacer.Call(func() (bool, error) {
+			mOut, err = f.c.CreateMultipartUpload(ctx, &mReq)
+			if err == nil {
+				if mOut == nil {
+					err = fserrors.RetryErrorf("internal error: no info from multipart upload")
+				} else if mOut.UploadId == nil {
+					err = fserrors.RetryErrorf("internal error: no UploadId in multipart upload: %#v", *mOut)
+				}
 			}
+			return f.shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return info, nil, fmt.Errorf("create multipart upload failed: %w", err)
 		}
-		return f.shouldRetry(ctx, err)
-	})
-	if err != nil {
-		return info, nil, fmt.Errorf("create multipart upload failed: %w", err)
 	}
 
 	chunkWriter := &s3ChunkWriter{
@@ -4630,7 +4785,9 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		key:                  ui.req.Key,
 		uploadID:             mOut.UploadId,
 		multiPartUploadInput: &mReq,
-		completedParts:       make([]types.CompletedPart, 0),
+		completedParts:       seeded,
+		resumedParts:         resumedParts,
+		resumed:              resumed,
 		ui:                   ui,
 		o:                    o,
 	}
@@ -4828,6 +4985,14 @@ func (o *Object) uploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.R
 	s3cw := chunkWriter.(*s3ChunkWriter)
 	gotETag = *stringClone(s3cw.eTag)
 	versionID = stringClone(s3cw.versionID)
+
+	if s3cw.resumed {
+		// Resumed parts were uploaded by a previous session so their
+		// per-part MD5s are unknown; S3 already validated every part
+		// ETag at CompleteMultipartUpload time. Leave wantETag empty
+		// to skip the hash-of-hashes check in Update.
+		return "", gotETag, versionID, s3cw.ui, nil
+	}
 
 	hashOfHashes := md5.Sum(s3cw.md5s)
 	wantETag = fmt.Sprintf("%s-%d", hex.EncodeToString(hashOfHashes[:]), len(s3cw.completedParts))

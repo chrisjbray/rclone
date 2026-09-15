@@ -108,6 +108,11 @@ func UploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.Reader, opt U
 		partNum := partNum
 		partOff := off
 		off += n
+		if sk, ok := chunkWriter.(interface{ SkipChunk(int) bool }); ok && sk.SkipChunk(int(partNum)) {
+			fs.Debugf(src, "multipart upload: skipping chunk %d size %v, already uploaded", partNum, fs.SizeSuffix(n))
+			free()
+			continue
+		}
 		g.Go(func() (err error) {
 			defer free()
 			fs.Debugf(src, "multipart upload: starting chunk %d size %v offset %v/%v", partNum, fs.SizeSuffix(n), fs.SizeSuffix(partOff), fs.SizeSuffix(size))

@@ -891,3 +891,57 @@ func TestBufferForObjectLockMD5(t *testing.T) {
 		assert.Equal(t, inUse, pool.Global().InUse(), "pool buffers leaked")
 	})
 }
+
+func TestMatchResumedParts(t *testing.T) {
+	const MiB = 1024 * 1024
+	etag := func(s string) *string { return &s }
+	part := func(num int32, size int64) types.Part {
+		return types.Part{
+			PartNumber: aws.Int32(num),
+			ETag:       etag(fmt.Sprintf("etag%d", num)),
+			Size:       aws.Int64(size),
+		}
+	}
+	t.Run("MatchingPrefixAdopted", func(t *testing.T) {
+		size := int64(25 * MiB)
+		chunk := int64(10 * MiB)
+		adopted, ok := matchResumedParts([]types.Part{part(1, 10*MiB), part(2, 10*MiB)}, size, chunk)
+		require.True(t, ok)
+		assert.Len(t, adopted, 2)
+		assert.Contains(t, adopted, 0)
+		assert.Contains(t, adopted, 1)
+	})
+	t.Run("CompleteSetAdopted", func(t *testing.T) {
+		size := int64(20 * MiB)
+		chunk := int64(10 * MiB)
+		adopted, ok := matchResumedParts([]types.Part{part(1, 10*MiB), part(2, 10*MiB)}, size, chunk)
+		require.True(t, ok)
+		assert.Len(t, adopted, 2)
+	})
+	t.Run("EmptyRejected", func(t *testing.T) {
+		_, ok := matchResumedParts(nil, 25*MiB, 10*MiB)
+		assert.False(t, ok)
+	})
+	t.Run("WrongChunkSizeRejected", func(t *testing.T) {
+		_, ok := matchResumedParts([]types.Part{part(1, 5*MiB)}, 25*MiB, 10*MiB)
+		assert.False(t, ok)
+	})
+	t.Run("PartBeyondFileRejected", func(t *testing.T) {
+		_, ok := matchResumedParts([]types.Part{part(1, 10*MiB), part(4, 5*MiB)}, 25*MiB, 10*MiB)
+		assert.False(t, ok)
+	})
+	t.Run("OversizeLastPartRejected", func(t *testing.T) {
+		_, ok := matchResumedParts([]types.Part{part(1, 10*MiB), part(3, 10*MiB)}, 25*MiB, 10*MiB)
+		assert.False(t, ok)
+	})
+	t.Run("MissingETagRejected", func(t *testing.T) {
+		bad := part(1, 10*MiB)
+		bad.ETag = nil
+		_, ok := matchResumedParts([]types.Part{bad}, 25*MiB, 10*MiB)
+		assert.False(t, ok)
+	})
+	t.Run("DuplicatePartRejected", func(t *testing.T) {
+		_, ok := matchResumedParts([]types.Part{part(1, 10*MiB), part(1, 10*MiB)}, 25*MiB, 10*MiB)
+		assert.False(t, ok)
+	})
+}
